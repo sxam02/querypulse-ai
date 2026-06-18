@@ -1,0 +1,126 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Organization {
+  id           String        @id @default(uuid())
+  name         String
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  users        User[]
+  applications Application[]
+}
+
+model User {
+  id             String       @id @default(uuid())
+  email          String       @unique
+  name           String
+  passwordHash   String
+  role           String       @default("MEMBER") // OWNER, ADMIN, MEMBER
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+model Application {
+  id                 String       @id @default(uuid())
+  name               String
+  environment        String       // Production, UAT, QA, Development
+  appType            String       // Spring Boot, Java EE, Micronaut, Quarkus
+  javaMelodyUrl      String?
+  awsAccessKey       String?
+  awsSecretKey       String?
+  site24x7ApiKey     String?
+  dbType             String       // PostgreSQL, MySQL, Oracle
+  cpuThreshold       Float        @default(80.0)
+  memoryThreshold    Float        @default(85.0)
+  queryTimeThreshold Int          @default(500) // in milliseconds
+  notificationChannels String[]   // ["EMAIL", "SLACK", "TEAMS"]
+  organizationId     String
+  organization       Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  incidents          Incident[]
+  alertRules         AlertRule[]
+}
+
+model Incident {
+  id                  String      @id @default(uuid())
+  applicationId       String
+  application         Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  timestamp           DateTime    @default(now())
+  cpu                 Float
+  memory              Float
+  threadCount         Int
+  activeSessions      Int
+  activeQueriesCount  Int
+  slowQueriesCount    Int
+  status              String      @default("ACTIVE") // ACTIVE, RESOLVED
+  severity            String      @default("HIGH") // CRITICAL, HIGH, MEDIUM, LOW
+  impactScore         Float       @default(0.0)
+  durationMinutes     Int         @default(0)
+  triggerMetric       String
+  timelineJson        String      // JSON string representation of events leading to spike
+  metricsSnapshotJson String      // JSON string representation of JVM and infra state
+  slowQueriesJson     String      // JSON string representation of SQL queries running during spike
+  rootCauseJson       String      // JSON string of AI Root Cause Analysis
+  createdAt           DateTime    @default(now())
+}
+
+model SqlQuery {
+  id             String   @id @default(uuid())
+  queryText      String   @unique
+  queryType      String   // SELECT, UPDATE, INSERT, DELETE
+  executionCount Int      @default(0)
+  avgDurationMs  Float    @default(0.0)
+  maxDurationMs  Float    @default(0.0)
+  cpuImpactPct   Float    @default(0.0)
+  severityScore  Float    @default(0.0)
+  rowsProcessed  Float    @default(0.0)
+  affectedTables String   // Comma-separated list or JSON array
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model AlertRule {
+  id             String      @id @default(uuid())
+  name           String
+  applicationId  String
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  metric         String      // CPU, Memory, Query Duration, Connection Pool
+  condition      String      // GREATER_THAN, LESS_THAN
+  threshold      Float
+  durationMinutes Int
+  channels       String[]    // ["EMAIL", "SLACK", "TEAMS"]
+  isEnabled      Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+}
+
+model AlertHistory {
+  id              String   @id @default(uuid())
+  ruleId          String?
+  ruleName        String
+  applicationName String
+  timestamp       DateTime @default(now())
+  message         String
+  severity        String   // CRITICAL, HIGH, MEDIUM, LOW
+  status          String   // TRIGGERED, RESOLVED
+}
+
+model Integration {
+  id               String    @id @default(uuid())
+  name             String
+  type             String    // JavaMelody, AWS CloudWatch, Site24x7
+  connectionStatus String    // CONNECTED, DISCONNECTED, DEGRADED
+  lastSyncTime     DateTime?
+  syncLogsJson     String    // JSON string for console log messages
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+}
