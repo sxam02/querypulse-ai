@@ -1417,7 +1417,7 @@ ${joined}${suffix}
         <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
           <div
             style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
-            onClick={() => router.push('/')}
+            onClick={() => router.push('/dashboard')}
           >
             <div style={{
               width: 32,
@@ -1491,7 +1491,7 @@ ${joined}${suffix}
             {dark ? <Sun style={{ width: 16, height: 16, color: CB.yellow }} /> : <Moon style={{ width: 16, height: 16, color: CB.primary }} />}
           </button>
           <button
-            onClick={() => router.push('/')}
+            onClick={() => router.push('/dashboard')}
             style={{
               ...pillBtnSecondary,
               height: 36,

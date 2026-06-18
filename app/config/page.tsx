@@ -182,7 +182,7 @@ export default function ConfigPage() {
 
     localStorage.setItem('querypulse_config', JSON.stringify(config));
     addToast('Configuration saved successfully!', 'success');
-    router.push('/');
+    router.push('/dashboard');
   };
 
   if (!mounted) {
@@ -221,7 +221,7 @@ export default function ConfigPage() {
             <Button 
               variant="ghost" 
               size="sm" 
-              onClick={() => router.push('/')}
+              onClick={() => router.push('/dashboard')}
               className="text-zinc-400 hover:text-zinc-100 flex items-center gap-1 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 h-8"
             >
               <ArrowLeft className="size-3.5" /> Back to Dashboard
