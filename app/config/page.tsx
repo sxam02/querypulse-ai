@@ -207,16 +207,27 @@ export default function ConfigPage() {
           </span>
         </div>
 
-        {hasConfig && (
+        <div className="flex items-center gap-2">
           <Button 
             variant="ghost" 
             size="sm" 
-            onClick={() => router.push('/')}
-            className="text-zinc-400 hover:text-zinc-100 flex items-center gap-1 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800"
+            onClick={() => router.push('/schema-compare')}
+            className="text-zinc-400 hover:text-zinc-100 flex items-center gap-1 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 h-8"
           >
-            <ArrowLeft className="size-3.5" /> Back to Dashboard
+            <Sliders className="size-3.5" /> Schema Compare
           </Button>
-        )}
+
+          {hasConfig && (
+            <Button 
+              variant="ghost" 
+              size="sm" 
+              onClick={() => router.push('/')}
+              className="text-zinc-400 hover:text-zinc-100 flex items-center gap-1 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 h-8"
+            >
+              <ArrowLeft className="size-3.5" /> Back to Dashboard
+            </Button>
+          )}
+        </div>
       </header>
 
       {/* Main Content Area */}

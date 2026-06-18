@@ -42,6 +42,7 @@ import {
   CheckCircle,
   XCircle,
   Loader2,
+  Sliders,
 } from 'lucide-react';
 
 interface TrendPoint {
@@ -451,6 +452,15 @@ export default function DashboardPage() {
               title="Force Refresh Now"
             >
               <RefreshCw className={`size-3.5 ${loading ? 'animate-spin text-violet-500' : ''}`} />
+            </Button>
+
+            <Button
+              size="sm"
+              onClick={() => router.push('/schema-compare')}
+              className="bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-300 font-medium text-xs flex items-center gap-1 h-8"
+            >
+              <Sliders className="size-3.5" />
+              Schema Compare
             </Button>
 
             <Button
