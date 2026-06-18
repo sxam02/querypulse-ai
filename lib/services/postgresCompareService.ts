@@ -62,6 +62,8 @@ export interface TypeSchema {
   name: string;
   values: string[]; // for enums
   category: string; // enum, domain, base, etc.
+  definition?: string; // full CREATE TYPE/DOMAIN statement
+  fields?: { field_name: string; data_type: string }[]; // for composite types
 }
 
 export interface SequenceSchema {
@@ -138,7 +140,11 @@ export class PostgresCompareService {
   /**
    * Extract database schema metadata from live PostgreSQL database
    */
-  static async extractSchema(config: DBConfig, components: string[]): Promise<DatabaseSchemaSnapshot> {
+  static async extractSchema(
+    config: DBConfig,
+    components: string[],
+    onProgress?: (message: string) => void
+  ): Promise<DatabaseSchemaSnapshot> {
     const client = this.getClient(config);
     await client.connect();
 
@@ -154,6 +160,70 @@ export class PostgresCompareService {
     try {
       // 1. TYPES & ENUMS (public schema only, skip auto-generated types)
       if (components.includes('types')) {
+        onProgress?.('Fetching composite types field definitions...');
+        const compositeFieldsRes = await client.query(`
+          SELECT 
+            t.typname AS type_name,
+            a.attname AS field_name,
+            format_type(a.atttypid, a.atttypmod) AS data_type
+          FROM pg_type t
+          JOIN pg_namespace n ON t.typnamespace = n.oid
+          JOIN pg_attribute a ON a.attrelid = t.typrelid
+          WHERE n.nspname = 'public'
+            AND t.typtype = 'c'
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+          ORDER BY t.typname, a.attnum
+        `);
+        const compositeFieldsMap = new Map<string, {field_name: string, data_type: string}[]>();
+        compositeFieldsRes.rows.forEach((row: any) => {
+          if (!compositeFieldsMap.has(row.type_name)) {
+            compositeFieldsMap.set(row.type_name, []);
+          }
+          compositeFieldsMap.get(row.type_name)!.push({
+            field_name: row.field_name,
+            data_type: row.data_type
+          });
+        });
+
+        onProgress?.('Fetching domain types definitions...');
+        const domainsRes = await client.query(`
+          SELECT 
+            t.typname AS type_name, 
+            format_type(t.typbasetype, t.typtypmod) AS underlying_type, 
+            t.typnotnull AS not_null, 
+            t.typdefault AS default_value,
+            (SELECT pg_catalog.array_to_string(ARRAY_AGG(pg_catalog.pg_get_constraintdef(r.oid, TRUE)), ' ')
+             FROM pg_catalog.pg_constraint r 
+             WHERE t.oid = r.contypid) AS check_constraints
+          FROM pg_catalog.pg_type t 
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace 
+          WHERE t.typtype = 'd'
+            AND n.nspname = 'public'
+        `);
+        const domainsMap = new Map<string, any>();
+        domainsRes.rows.forEach((row: any) => {
+          domainsMap.set(row.type_name, row);
+        });
+
+        onProgress?.('Fetching range types definitions...');
+        const rangesRes = await client.query(`
+          SELECT 
+            t.typname AS type_name,
+            s.typname AS subtype_name
+          FROM pg_type t
+          JOIN pg_namespace n ON t.typnamespace = n.oid
+          JOIN pg_range r ON t.oid = r.rngtypid
+          JOIN pg_type s ON r.rngsubtype = s.oid
+          WHERE t.typtype = 'r'
+            AND n.nspname = 'public'
+        `);
+        const rangesMap = new Map<string, string>();
+        rangesRes.rows.forEach((row: any) => {
+          rangesMap.set(row.type_name, row.subtype_name);
+        });
+
+        onProgress?.('Fetching types list and enums...');
         const typesQuery = `
           SELECT 
             t.typname AS type_name,
@@ -174,21 +244,72 @@ export class PostgresCompareService {
         const res = await client.query(typesQuery);
         res.rows.forEach((row: any) => {
           let category = 'base';
-          if (row.type_category === 'e') category = 'enum';
-          else if (row.type_category === 'd') category = 'domain';
-          else if (row.type_category === 'c') category = 'composite';
-          else if (row.type_category === 'r') category = 'range';
+          let definition = '';
+
+          let enumValues: string[] = [];
+          if (Array.isArray(row.enum_values)) {
+            enumValues = row.enum_values;
+          } else if (typeof row.enum_values === 'string') {
+            enumValues = row.enum_values
+              .replace(/^\{|\}$/g, '')
+              .split(',')
+              .map((v: string) => v.replace(/^"|"$/g, '').trim())
+              .filter(Boolean);
+          }
+
+          if (row.type_category === 'e') {
+            category = 'enum';
+            definition = `CREATE TYPE ${row.type_name} AS ENUM (${enumValues.map((v: string) => `'${v}'`).join(', ')});`;
+          } else if (row.type_category === 'd') {
+            category = 'domain';
+            const domInfo = domainsMap.get(row.type_name);
+            if (domInfo) {
+              let ddl = `CREATE DOMAIN ${row.type_name} AS ${domInfo.underlying_type}`;
+              if (domInfo.default_value) {
+                ddl += ` DEFAULT ${domInfo.default_value}`;
+              }
+              if (domInfo.not_null) {
+                ddl += ` NOT NULL`;
+              }
+              if (domInfo.check_constraints) {
+                ddl += ` ${domInfo.check_constraints}`;
+              }
+              ddl += ';';
+              definition = ddl;
+            } else {
+              definition = `-- Warning: Domain Type "${row.type_name}" definition not found.\n-- CREATE DOMAIN ${row.type_name} ...;`;
+            }
+          } else if (row.type_category === 'c') {
+            category = 'composite';
+            const fields = compositeFieldsMap.get(row.type_name) || [];
+            if (fields.length > 0) {
+              definition = `CREATE TYPE ${row.type_name} AS (\n${fields.map(f => `  ${f.field_name} ${f.data_type}`).join(',\n')}\n);`;
+            } else {
+              definition = `-- Warning: Composite Type "${row.type_name}" has no fields.\n-- CREATE TYPE ${row.type_name} ...;`;
+            }
+          } else if (row.type_category === 'r') {
+            category = 'range';
+            const subtype = rangesMap.get(row.type_name);
+            if (subtype) {
+              definition = `CREATE TYPE ${row.type_name} AS RANGE (\n  SUBTYPE = ${subtype}\n);`;
+            } else {
+              definition = `-- Warning: Range Type "${row.type_name}" subtype not found.\n-- CREATE TYPE ${row.type_name} ...;`;
+            }
+          }
 
           snapshot.types[row.type_name] = {
             name: row.type_name,
-            values: row.enum_values || [],
+            values: enumValues,
             category,
+            definition,
+            fields: category === 'composite' ? compositeFieldsMap.get(row.type_name) || [] : undefined,
           };
         });
       }
 
       // 2. SEQUENCES (public schema only, use pg_sequences for speed)
       if (components.includes('sequences')) {
+        onProgress?.('Fetching sequences list and values...');
         const seqQuery = `
           SELECT 
             s.sequencename AS sequence_name,
@@ -219,104 +340,134 @@ export class PostgresCompareService {
 
       // 3. TABLES (with Columns, Primary Keys, Foreign Keys, and Indexes)
       if (components.includes('tables')) {
+        onProgress?.('Querying list of user tables...');
         // Get all user tables
         const tablesRes = await client.query(`
           SELECT table_name 
           FROM information_schema.tables 
           WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
         `);
+        const tableNames = tablesRes.rows.map((tRow: any) => tRow.table_name);
 
-        for (const tRow of tablesRes.rows) {
-          const tableName = tRow.table_name;
-
-          // Columns
-          const colsRes = await client.query(`
-            SELECT 
-              column_name, 
-              data_type, 
-              is_nullable, 
-              column_default, 
-              character_maximum_length
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = $1
-            ORDER BY ordinal_position
-          `, [tableName]);
-
-          const columns: ColumnInfo[] = colsRes.rows.map((c: any) => ({
+        onProgress?.(`Found ${tableNames.length} tables. Fetching columns for all tables...`);
+        // Batch fetch all columns
+        const allColsRes = await client.query(`
+          SELECT 
+            table_name,
+            column_name, 
+            data_type, 
+            is_nullable, 
+            column_default, 
+            character_maximum_length
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+          ORDER BY table_name, ordinal_position
+        `);
+        const columnsByTable: Record<string, ColumnInfo[]> = {};
+        allColsRes.rows.forEach((c: any) => {
+          if (!columnsByTable[c.table_name]) {
+            columnsByTable[c.table_name] = [];
+          }
+          columnsByTable[c.table_name].push({
             name: c.column_name,
             dataType: c.data_type,
             isNullable: c.is_nullable === 'YES',
             columnDefault: c.column_default,
             maxLength: c.character_maximum_length ? parseInt(c.character_maximum_length, 10) : null,
-          }));
+          });
+        });
 
-          // Primary Keys
-          const pkRes = await client.query(`
-            SELECT kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu 
-              ON tc.constraint_name = kcu.constraint_name 
-             AND tc.table_schema = kcu.table_schema
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-              AND tc.table_schema = 'public'
-              AND tc.table_name = $1
-            ORDER BY kcu.ordinal_position
-          `, [tableName]);
-          const primaryKey = pkRes.rows.map((pk: any) => pk.column_name);
+        onProgress?.('Fetching primary keys for all tables...');
+        // Batch fetch all primary keys
+        const allPkRes = await client.query(`
+          SELECT 
+            tc.table_name,
+            kcu.column_name
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage kcu 
+            ON tc.constraint_name = kcu.constraint_name 
+           AND tc.table_schema = kcu.table_schema
+          WHERE tc.constraint_type = 'PRIMARY KEY'
+            AND tc.table_schema = 'public'
+          ORDER BY tc.table_name, kcu.ordinal_position
+        `);
+        const pksByTable: Record<string, string[]> = {};
+        allPkRes.rows.forEach((pk: any) => {
+          if (!pksByTable[pk.table_name]) {
+            pksByTable[pk.table_name] = [];
+          }
+          pksByTable[pk.table_name].push(pk.column_name);
+        });
 
-          // Foreign Keys
-          const fkRes = await client.query(`
-            SELECT
-              tc.constraint_name,
-              kcu.column_name,
-              ccu.table_name AS foreign_table_name,
-              ccu.column_name AS foreign_column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-            JOIN information_schema.constraint_column_usage ccu
-              ON ccu.constraint_name = tc.constraint_name
-             AND ccu.table_schema = tc.table_schema
-            WHERE tc.constraint_type = 'FOREIGN KEY'
-              AND tc.table_schema = 'public'
-              AND tc.table_name = $1
-          `, [tableName]);
-          const foreignKeys = fkRes.rows.map((fk: any) => ({
+        onProgress?.('Fetching foreign keys for all tables...');
+        // Batch fetch all foreign keys
+        const allFkRes = await client.query(`
+          SELECT
+            tc.table_name,
+            tc.constraint_name,
+            kcu.column_name,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+           AND tc.table_schema = kcu.table_schema
+          JOIN information_schema.constraint_column_usage ccu
+            ON ccu.constraint_name = tc.constraint_name
+           AND ccu.table_schema = tc.table_schema
+          WHERE tc.constraint_type = 'FOREIGN KEY'
+            AND tc.table_schema = 'public'
+        `);
+        const fksByTable: Record<string, any[]> = {};
+        allFkRes.rows.forEach((fk: any) => {
+          if (!fksByTable[fk.table_name]) {
+            fksByTable[fk.table_name] = [];
+          }
+          fksByTable[fk.table_name].push({
             constraintName: fk.constraint_name,
             columnName: fk.column_name,
             foreignTable: fk.foreign_table_name,
             foreignColumn: fk.foreign_column_name,
-          }));
+          });
+        });
 
-          // Indexes
-          const idxRes = await client.query(`
-            SELECT
-              schemaname,
-              tablename,
-              indexname,
-              indexdef
-            FROM pg_indexes
-            WHERE schemaname = 'public' AND tablename = $1
-          `, [tableName]);
-          const indexes = idxRes.rows.map((idx: any) => ({
+        onProgress?.('Fetching indexes for all tables...');
+        // Batch fetch all indexes
+        const allIdxRes = await client.query(`
+          SELECT
+            tablename,
+            indexname,
+            indexdef
+          FROM pg_indexes
+          WHERE schemaname = 'public'
+        `);
+        const idxsByTable: Record<string, any[]> = {};
+        allIdxRes.rows.forEach((idx: any) => {
+          if (!idxsByTable[idx.tablename]) {
+            idxsByTable[idx.tablename] = [];
+          }
+          idxsByTable[idx.tablename].push({
             name: idx.indexname,
             definition: idx.indexdef,
             isUnique: idx.indexdef.includes('UNIQUE INDEX'),
-          }));
+          });
+        });
 
+        onProgress?.('Assembling structures schema snapshots...');
+        for (const tableName of tableNames) {
           snapshot.tables[tableName] = {
             name: tableName,
-            columns,
-            primaryKey,
-            foreignKeys,
-            indexes,
+            columns: columnsByTable[tableName] || [],
+            primaryKey: pksByTable[tableName] || [],
+            foreignKeys: fksByTable[tableName] || [],
+            indexes: idxsByTable[tableName] || [],
           };
         }
       }
 
       // 4. VIEWS
       if (components.includes('views')) {
+        onProgress?.('Fetching views definitions...');
         const viewsQuery = `
           SELECT table_name, view_definition
           FROM information_schema.views
@@ -333,6 +484,7 @@ export class PostgresCompareService {
 
       // 5. FUNCTIONS (public schema only, skip extension-owned and internal)
       if (components.includes('functions')) {
+        onProgress?.('Querying functions parameters and definitions...');
         const funcQuery = `
           WITH filtered_funcs AS (
             SELECT 
@@ -373,6 +525,7 @@ export class PostgresCompareService {
 
       // 6. TRIGGERS
       if (components.includes('triggers')) {
+        onProgress?.('Fetching triggers declarations...');
         const trigQuery = `
           SELECT 
             trigger_name, 
@@ -461,12 +614,7 @@ export class PostgresCompareService {
         if (src && !dst) {
           // Missing
           addDrift('missing');
-          let ddl = '';
-          if (src.category === 'enum') {
-            ddl = `CREATE TYPE ${typeName} AS ENUM (${src.values.map(v => `'${v}'`).join(', ')});`;
-          } else {
-            ddl = `-- Warning: Domain/Composite Type "${typeName}" needs manual replication\n-- CREATE TYPE ${typeName} ...;`;
-          }
+          const ddl = src.definition || `-- Warning: Type "${typeName}" definition not found.\n-- CREATE TYPE ${typeName} ...;`;
           result.types.push({
             name: typeName,
             status: 'missing',
@@ -478,11 +626,11 @@ export class PostgresCompareService {
         } else if (!src && dst) {
           // Extra
           addDrift('extra');
-          const ddl = `DROP TYPE ${typeName};`;
+          const ddl = dst.definition || `-- Warning: Type "${typeName}" definition not found.\n-- CREATE TYPE ${typeName} ...;`;
           result.types.push({
             name: typeName,
             status: 'extra',
-            details: `Custom type ${typeName} exists in destination but not in source schema.`,
+            details: `Custom type ${typeName} exists in destination but not in source schema (Available for backmerge).`,
             ddl,
             destDef: ddl,
           });
@@ -491,31 +639,69 @@ export class PostgresCompareService {
           // Compare definition
           const valuesMatch = JSON.stringify(src.values) === JSON.stringify(dst.values);
           const catMatch = src.category === dst.category;
-          if (!valuesMatch || !catMatch) {
+          const defMatch = src.definition === dst.definition;
+          if (!valuesMatch || !catMatch || !defMatch) {
             addDrift('different');
             let ddl = '';
             let details = '';
-            if (src.category === 'enum' && dst.category === 'enum') {
+             if (src.category === 'enum' && dst.category === 'enum') {
               // Postgres enum alter (adding new values)
               const missingValues = src.values.filter(v => !dst.values.includes(v));
               if (missingValues.length > 0) {
                 ddl = missingValues.map(v => `ALTER TYPE ${typeName} ADD VALUE '${v}';`).join('\n');
                 details = `Enum type ${typeName} is missing values: ${missingValues.join(', ')}.`;
               } else {
-                ddl = `-- Enum values mismatched but cannot ALTER to delete values. Re-creation recommended.\n-- DROP TYPE ${typeName};\n-- CREATE TYPE ${typeName} AS ENUM (${src.values.map(v => `'${v}'`).join(', ')});`;
+                ddl = `-- Enum values mismatched but cannot ALTER to delete values. Re-creation recommended.\n-- DROP TYPE ${typeName} CASCADE;\n${src.definition || ''}`;
                 details = `Enum type ${typeName} values mismatch (Source: [${src.values.join(', ')}], Dest: [${dst.values.join(', ')}]).`;
               }
+            } else if (src.category === 'composite' && dst.category === 'composite') {
+              const srcFields = src.fields || [];
+              const dstFields = dst.fields || [];
+              const srcFieldMap = new Map(srcFields.map(f => [f.field_name, f]));
+              const dstFieldMap = new Map(dstFields.map(f => [f.field_name, f]));
+
+              const alters: string[] = [];
+              const typeDrifts: string[] = [];
+
+              // Check missing fields in destination (need to add them)
+              srcFields.forEach((srcField) => {
+                const dstField = dstFieldMap.get(srcField.field_name);
+                if (!dstField) {
+                  alters.push(`ALTER TYPE ${typeName} ADD ATTRIBUTE ${srcField.field_name} ${srcField.data_type};`);
+                  typeDrifts.push(`Missing attribute: ${srcField.field_name} (${srcField.data_type})`);
+                } else if (srcField.data_type !== dstField.data_type) {
+                  alters.push(`ALTER TYPE ${typeName} ALTER ATTRIBUTE ${srcField.field_name} TYPE ${srcField.data_type};`);
+                  typeDrifts.push(`Drifted attribute type: ${srcField.field_name} (Source: ${srcField.data_type}, Target: ${dstField.data_type})`);
+                }
+              });
+
+              // Check extra fields in destination (commented out DROP ATTRIBUTE)
+              dstFields.forEach((dstField) => {
+                if (!srcFieldMap.has(dstField.field_name)) {
+                  alters.push(`-- ALTER TYPE ${typeName} DROP ATTRIBUTE ${dstField.field_name};`);
+                  typeDrifts.push(`Extra attribute: ${dstField.field_name}`);
+                }
+              });
+
+              if (alters.length > 0) {
+                ddl = alters.join('\n');
+                details = `Composite type ${typeName} attributes drifted: ${typeDrifts.join('; ')}`;
+              } else {
+                ddl = `-- Composite type ${typeName} attributes mismatched but no direct alterations found. Re-creation recommended.\n-- DROP TYPE ${typeName} CASCADE;\n${src.definition || ''}`;
+                details = `Composite type ${typeName} attributes mismatched.`;
+              }
             } else {
-              ddl = `-- Type drift in composite/domain type "${typeName}"\n-- ALTER TYPE ${typeName} ...;`;
-              details = `Custom type category or properties differ.`;
+              const dropKeyword = src.category === 'domain' ? 'DOMAIN' : 'TYPE';
+              ddl = `-- Type drift in ${src.category} type "${typeName}". Re-creation recommended.\n-- DROP ${dropKeyword} ${typeName} CASCADE;\n${src.definition || ''}`;
+              details = `Custom type (${src.category}) definitions differ.`;
             }
             result.types.push({
               name: typeName,
               status: 'different',
               details,
               ddl,
-              sourceDef: `TYPE ${typeName}: Category: ${src.category}, Values: [${src.values.join(', ')}]`,
-              destDef: `TYPE ${typeName}: Category: ${dst.category}, Values: [${dst.values.join(', ')}]`,
+              sourceDef: src.definition || `TYPE ${typeName}: Category: ${src.category}, Values: [${src.values.join(', ')}]`,
+              destDef: dst.definition || `TYPE ${typeName}: Category: ${dst.category}, Values: [${dst.values.join(', ')}]`,
             });
             sqlStatements.push(ddl);
           }
@@ -543,11 +729,11 @@ export class PostgresCompareService {
           sqlStatements.push(ddl);
         } else if (!src && dst) {
           addDrift('extra');
-          const ddl = `DROP SEQUENCE ${seqName};`;
+          const ddl = `CREATE SEQUENCE ${seqName} START WITH ${dst.startValue} INCREMENT BY ${dst.increment};`;
           result.sequences.push({
             name: seqName,
             status: 'extra',
-            details: `Sequence "${seqName}" is extra in Destination.`,
+            details: `Sequence "${seqName}" exists in destination but not in source schema (Available for backmerge).`,
             ddl,
             destDef: ddl,
           });
@@ -623,11 +809,40 @@ export class PostgresCompareService {
           sqlStatements.push(ddl);
         } else if (!src && dst) {
           addDrift('extra');
-          const ddl = `DROP TABLE ${tableName} CASCADE;`;
+          // Construct full CREATE TABLE script from destination (for backmerge)
+          let ddl = `CREATE TABLE ${tableName} (\n`;
+          const colLines = dst.columns.map((col) => {
+            let line = `  ${col.name} ${col.dataType}`;
+            if (col.maxLength) line += `(${col.maxLength})`;
+            if (!col.isNullable) line += ' NOT NULL';
+            if (col.columnDefault) line += ` DEFAULT ${col.columnDefault}`;
+            return line;
+          });
+
+          if (dst.primaryKey.length > 0) {
+            colLines.push(`  CONSTRAINT ${tableName}_pkey PRIMARY KEY (${dst.primaryKey.join(', ')})`);
+          }
+
+          dst.foreignKeys.forEach((fk) => {
+            colLines.push(`  CONSTRAINT ${fk.constraintName} FOREIGN KEY (${fk.columnName}) REFERENCES ${fk.foreignTable} (${fk.foreignColumn})`);
+          });
+
+          ddl += colLines.join(',\n') + '\n);';
+
+          if (dst.indexes && dst.indexes.length > 0) {
+            const indexDDLs = dst.indexes
+              .filter(idx => !idx.name.endsWith('_pkey'))
+              .map(idx => idx.definition + ';')
+              .join('\n');
+            if (indexDDLs) {
+              ddl += '\n\n' + indexDDLs;
+            }
+          }
+
           result.tables.push({
             name: tableName,
             status: 'extra',
-            details: `Table "${tableName}" exists in destination but not in source schema.`,
+            details: `Table "${tableName}" exists in destination but not in source schema (Available for backmerge).`,
             ddl,
             destDef: ddl,
           });
@@ -684,8 +899,14 @@ export class PostgresCompareService {
           // Find extra columns
           dstCols.forEach((dstCol) => {
             if (!srcColMap.has(dstCol.name)) {
-              tableAlters.push(`ALTER TABLE ${tableName} DROP COLUMN ${dstCol.name};`);
-              driftDetails.push(`Extra column: ${dstCol.name}`);
+              let addColDdl = `ALTER TABLE ${tableName} ADD COLUMN ${dstCol.name} ${dstCol.dataType}`;
+              if (dstCol.maxLength) addColDdl += `(${dstCol.maxLength})`;
+              if (!dstCol.isNullable) addColDdl += ' NOT NULL';
+              if (dstCol.columnDefault) addColDdl += ` DEFAULT ${dstCol.columnDefault}`;
+              addColDdl += ';';
+
+              tableAlters.push(addColDdl);
+              driftDetails.push(`Extra column: ${dstCol.name} (Available for backmerge)`);
             }
           });
 
@@ -708,8 +929,8 @@ export class PostgresCompareService {
           dstIndexes.forEach((dstIdx) => {
             if (dstIdx.name.endsWith('_pkey')) return;
             if (!srcIndexMap.has(dstIdx.name)) {
-              tableAlters.push(`DROP INDEX ${dstIdx.name};`);
-              driftDetails.push(`Extra index: ${dstIdx.name}`);
+              tableAlters.push(dstIdx.definition + ';');
+              driftDetails.push(`Extra index: ${dstIdx.name} (Available for backmerge)`);
             }
           });
 
@@ -750,11 +971,11 @@ export class PostgresCompareService {
           sqlStatements.push(ddl);
         } else if (!src && dst) {
           addDrift('extra');
-          const ddl = `DROP VIEW ${viewName};`;
+          const ddl = `CREATE OR REPLACE VIEW ${viewName} AS\n${dst.definition.trim()};`;
           result.views.push({
             name: viewName,
             status: 'extra',
-            details: `View "${viewName}" exists in destination but not in source schema.`,
+            details: `View "${viewName}" exists in destination but not in source schema (Available for backmerge).`,
             ddl,
             destDef: ddl,
           });
@@ -801,11 +1022,11 @@ export class PostgresCompareService {
           sqlStatements.push(ddl);
         } else if (!src && dst) {
           addDrift('extra');
-          const ddl = `DROP FUNCTION ${funcName}(${dst.arguments});`;
+          const ddl = dst.definition.trim() + ';';
           result.functions.push({
             name: funcName,
             status: 'extra',
-            details: `Function "${funcName}" exists in destination but not in source schema.`,
+            details: `Function "${funcName}" exists in destination but not in source schema (Available for backmerge).`,
             ddl,
             destDef: dst.definition,
           });
@@ -852,11 +1073,11 @@ export class PostgresCompareService {
           sqlStatements.push(ddl);
         } else if (!src && dst) {
           addDrift('extra');
-          const ddl = `DROP TRIGGER ${trigName} ON ${dst.tableName};`;
+          const ddl = `CREATE TRIGGER ${trigName} ${dst.timing} ${dst.event} ON ${dst.tableName}\nFOR EACH ROW ${dst.statement};`;
           result.triggers.push({
             name: trigName,
             status: 'extra',
-            details: `Trigger "${trigName}" is present in destination but not in source schema.`,
+            details: `Trigger "${trigName}" is present in destination but not in source schema (Available for backmerge).`,
             ddl,
             destDef: ddl,
           });
@@ -870,7 +1091,7 @@ export class PostgresCompareService {
 
           if (!timingMatch || !eventMatch || !tableMatch || !stmtMatch) {
             addDrift('different');
-            const ddl = `DROP TRIGGER ${trigName} ON ${dst.tableName};\nCREATE TRIGGER ${trigName} ${src.timing} ${src.event} ON ${src.tableName}\nFOR EACH ROW ${src.statement};`;
+            const ddl = `-- DROP TRIGGER ${trigName} ON ${dst.tableName};\nCREATE TRIGGER ${trigName} ${src.timing} ${src.event} ON ${src.tableName}\nFOR EACH ROW ${src.statement};`;
             result.triggers.push({
               name: trigName,
               status: 'different',
@@ -917,19 +1138,22 @@ COMMIT;
       'order_status_enum': {
         name: 'order_status_enum',
         values: ['draft', 'pending', 'paid', 'shipped', 'cancelled', 'refunded'],
-        category: 'enum'
+        category: 'enum',
+        definition: "CREATE TYPE order_status_enum AS ENUM ('draft', 'pending', 'paid', 'shipped', 'cancelled', 'refunded');"
       },
       'user_role_domain': {
         name: 'user_role_domain',
         values: [],
-        category: 'domain'
+        category: 'domain',
+        definition: "CREATE DOMAIN user_role_domain AS varchar(50) CHECK (VALUE IN ('admin', 'user', 'guest'));"
       }
     };
     const destTypes: Record<string, TypeSchema> = {
       'order_status_enum': {
         name: 'order_status_enum',
         values: ['draft', 'pending', 'paid', 'shipped', 'cancelled'],
-        category: 'enum'
+        category: 'enum',
+        definition: "CREATE TYPE order_status_enum AS ENUM ('draft', 'pending', 'paid', 'shipped', 'cancelled');"
       }
     };
 

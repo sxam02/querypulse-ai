@@ -476,7 +476,7 @@ export default function DashboardPage() {
       </header>
 
       {/* Main Grid Layout */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 space-y-6">
+      <main className="flex-1 max-w-full w-full p-6 space-y-6">
         {/* Error Alert Display */}
         {lastError && (
           <div className="p-3 bg-rose-950/20 border border-rose-900/40 rounded-xl text-rose-400 text-xs font-mono flex items-start gap-2 shadow-md">

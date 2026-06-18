@@ -231,7 +231,7 @@ export default function ConfigPage() {
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 max-w-4xl w-full mx-auto p-6 space-y-6 flex flex-col justify-center">
+      <main className="flex-1 max-w-full w-full p-8 space-y-6 flex flex-col justify-center">
         <div className="text-center max-w-lg mx-auto space-y-2 mb-4">
           <h1 className="text-2xl font-bold tracking-tight text-white">Telemetry Settings</h1>
           <p className="text-xs text-zinc-400">

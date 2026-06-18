@@ -1,0 +1,20 @@
+[
+  {
+    "id": "prof-1781785520012",
+    "name": "TMS DB Internal",
+    "host": "pgdb.veapp.net",
+    "port": "5432",
+    "database": "tms_internal_14",
+    "username": "postgres",
+    "password": "12@p0stGreS"
+  },
+  {
+    "id": "prof-1781785552797",
+    "name": "OLD tms_internal_14_copy",
+    "host": "pgdb.veapp.net",
+    "port": "5432",
+    "database": "tms_internal_14_copy",
+    "username": "postgres",
+    "password": "12@p0stGreS"
+  }
+]
