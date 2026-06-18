@@ -1,9 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ['10.0.10.21'],
+  allowedDevOrigins: ['10.0.10.21', '172.16.10.83'],
   experimental: {
-    middlewareClientMaxBodySize: '100mb',
+    proxyClientMaxBodySize: '100mb',
   },
 };
 
