@@ -159,7 +159,13 @@ export default function SchemaComparePage() {
     background: CB.surfaceDarkEl, borderRadius: 24, border: 'none', overflow: 'hidden',
   };
   const [mounted, setMounted] = useState(false);
-  const [activeParentTab, setActiveParentTab] = useState<'compare' | 'profiles'>('compare');
+  const [activeParentTab, setActiveParentTab] = useState<'compare' | 'profiles' | 'logs'>('compare');
+
+  // Execution logs state
+  const [allExecutionLogs, setAllExecutionLogs] = useState<any[]>([]);
+  const [loadingLogs, setLoadingLogs] = useState(false);
+  const [expandedExecId, setExpandedExecId] = useState<string | null>(null);
+  const [expandedStepName, setExpandedStepName] = useState<string | null>(null);
 
   // Wizard Step State: 1 = DB Config, 2 = Component Select, 3 = Results
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -259,6 +265,65 @@ export default function SchemaComparePage() {
   // Comparison result states
   const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
   const [compareError, setCompareError] = useState('');
+  const [skipBackupObjects, setSkipBackupObjects] = useState(false);
+  const [skipDummyObjects, setSkipDummyObjects] = useState(false);
+
+  // Helper to identify backup objects based on trailing _ddmmyy or _ddmmyyyy
+  const isBackupObject = (name: string): boolean => {
+    const regex = /_(\d{6}|\d{8})$/;
+    return regex.test(name);
+  };
+
+  // Helper to identify dummy objects ending with trailing _1, _2, _3 etc. (excluding backup dates)
+  const isDummyObject = (name: string): boolean => {
+    const regex = /_(\d+)$/;
+    const match = name.match(regex);
+    if (!match) return false;
+    const digits = match[1];
+    return digits.length !== 6 && digits.length !== 8;
+  };
+
+  const filteredCompareResult = useMemo(() => {
+    if (!compareResult) return null;
+    if (!skipBackupObjects && !skipDummyObjects) return compareResult;
+
+    const filtered: any = {
+      summary: {
+        totalDrifts: 0,
+        missingCount: 0,
+        extraCount: 0,
+        differentCount: 0,
+      },
+      tables: [],
+      views: [],
+      functions: [],
+      triggers: [],
+      types: [],
+      sequences: [],
+    };
+
+    const compKeys = ['tables', 'views', 'functions', 'triggers', 'types', 'sequences'];
+    compKeys.forEach((key) => {
+      const items = (compareResult as any)[key] as CompareResultItem[] || [];
+      const filteredItems = items.filter(item => {
+        if (skipBackupObjects && isBackupObject(item.name)) return false;
+        if (skipDummyObjects && isDummyObject(item.name)) return false;
+        return true;
+      });
+      filtered[key] = filteredItems;
+
+      filteredItems.forEach((item) => {
+        if (item.status !== 'identical') {
+          filtered.summary.totalDrifts++;
+          if (item.status === 'missing') filtered.summary.missingCount++;
+          else if (item.status === 'extra') filtered.summary.extraCount++;
+          else if (item.status === 'different') filtered.summary.differentCount++;
+        }
+      });
+    });
+
+    return filtered;
+  }, [compareResult, skipBackupObjects, skipDummyObjects]);
 
   // active item viewer states
   const [activeCompType, setActiveCompType] = useState<string>('tables');
@@ -277,13 +342,13 @@ export default function SchemaComparePage() {
   const [sendingEmail, setSendingEmail] = useState(false);
 
   const componentsWithDrifts = useMemo(() => {
-    if (!compareResult) return [];
+    if (!filteredCompareResult) return [];
     const compTypes = ['tables', 'views', 'functions', 'triggers', 'types', 'sequences'];
     return compTypes.filter(compKey => {
-      const items = (compareResult as any)[compKey] as CompareResultItem[] || [];
+      const items = (filteredCompareResult as any)[compKey] as CompareResultItem[] || [];
       return items.some(item => item.status !== 'identical');
     });
-  }, [compareResult]);
+  }, [filteredCompareResult]);
 
   useEffect(() => {
     if (showEmailModal) {
@@ -346,6 +411,34 @@ export default function SchemaComparePage() {
   const addLog = (msg: string) => {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     setTerminalLogs(prev => [...prev, `[${time}] ${msg}`]);
+  };
+
+  const loadExecutionLogs = async () => {
+    setLoadingLogs(true);
+    try {
+      const res = await fetch('/api/execution-logs');
+      if (res.ok) {
+        const data = await res.json();
+        setAllExecutionLogs(data);
+      }
+    } catch (e) {
+      console.error('Failed to fetch execution logs', e);
+    } finally {
+      setLoadingLogs(false);
+    }
+  };
+
+  const handleClearExecutionLogs = async () => {
+    if (!window.confirm('Are you sure you want to clear all execution logs?')) return;
+    try {
+      const res = await fetch('/api/execution-logs', { method: 'DELETE' });
+      if (res.ok) {
+        setAllExecutionLogs([]);
+        addToast('Execution logs cleared', 'success');
+      }
+    } catch (e) {
+      console.error('Failed to clear execution logs', e);
+    }
   };
 
   // Profile selection fill callbacks
@@ -653,6 +746,7 @@ export default function SchemaComparePage() {
     setCompareError('');
     setTerminalLogs([]);
 
+    const executionId = `exec-${Date.now()}`;
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
     const sourceDb = {
@@ -678,6 +772,25 @@ export default function SchemaComparePage() {
       destination: { host: destHost, port: destPort, database: destDatabase, username: destUsername }
     }));
 
+    // Initialize execution logging
+    try {
+      const sourceDbName = `${srcDatabase || 'demo-source'} (${srcHost || 'demo-source'})`;
+      const destDbName = `${destDatabase || 'demo-destination'} (${destHost || 'demo-destination'})`;
+      await fetch('/api/execution-logs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'start',
+          id: executionId,
+          sourceDb: sourceDbName,
+          destDb: destDbName,
+          components: selectedComponents
+        })
+      });
+    } catch (logErr) {
+      console.error('Failed to initialize execution logs:', logErr);
+    }
+
     try {
       addLog('🚀 Starting schema comparison workflow.');
       addLog(`Selected components to analyze: [ ${selectedComponents.join(', ')} ]`);
@@ -688,7 +801,10 @@ export default function SchemaComparePage() {
 
       const testRes = await fetch('/api/compare-test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-execution-id': executionId
+        },
         body: JSON.stringify({ sourceDb, destinationDb })
       });
       const testData = await testRes.json();
@@ -714,7 +830,10 @@ export default function SchemaComparePage() {
       ) => {
         const res = await fetch('/api/compare-extract', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-execution-id': executionId
+          },
           body: JSON.stringify({
             dbConfig: config,
             component: comp,
@@ -830,7 +949,10 @@ export default function SchemaComparePage() {
 
       const diffRes = await fetch('/api/compare-diff', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-execution-id': executionId
+        },
         body: JSON.stringify({
           sourceSnapshot,
           destinationSnapshot: destSnapshot,
@@ -868,12 +990,43 @@ export default function SchemaComparePage() {
         else setActiveDriftTab('missing');
       }
 
+      // Update execution status on backend to success
+      try {
+        await fetch('/api/execution-logs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'update',
+            id: executionId,
+            status: 'success'
+          })
+        });
+      } catch (logErr) {
+        console.error('Failed to update execution log:', logErr);
+      }
+
       setStep(3);
       addToast('Database schema comparison completed successfully!', 'success');
     } catch (err: any) {
       addLog(`❌ ERROR: ${err.message}`);
       setCompareError(err.message || 'Comparison failed');
       addToast('Failed to compare database schemas', 'error');
+
+      // Update execution status on backend to failed
+      try {
+        await fetch('/api/execution-logs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'update',
+            id: executionId,
+            status: 'failed',
+            error: err.message || 'Comparison failed'
+          })
+        });
+      } catch (logErr) {
+        console.error('Failed to update execution log to failed:', logErr);
+      }
     } finally {
       setLoadingCompare(false);
     }
@@ -881,10 +1034,10 @@ export default function SchemaComparePage() {
 
   // Derived filter items
   const activeDriftItems = useMemo(() => {
-    if (!compareResult || !activeCompType) return [];
-    const items = (compareResult as any)[activeCompType] as CompareResultItem[];
+    if (!filteredCompareResult || !activeCompType) return [];
+    const items = (filteredCompareResult as any)[activeCompType] as CompareResultItem[];
     return items.filter(item => item.status === activeDriftTab);
-  }, [compareResult, activeCompType, activeDriftTab]);
+  }, [filteredCompareResult, activeCompType, activeDriftTab]);
 
   const selectedDriftItem = useMemo(() => {
     if (activeDriftItems.length === 0) return null;
@@ -919,7 +1072,7 @@ export default function SchemaComparePage() {
         const order = ['types', 'sequences', 'tables', 'views', 'functions', 'triggers'];
         const sqlStatements: string[] = [];
         order.forEach((compKey) => {
-          const items = (compareResult as any)[compKey] as CompareResultItem[] || [];
+          const items = (filteredCompareResult as any)[compKey] as CompareResultItem[] || [];
           items.forEach((item) => {
             if (item.status !== 'identical' && item.ddl) {
               sqlStatements.push(item.ddl);
@@ -939,7 +1092,7 @@ export default function SchemaComparePage() {
         });
       } else {
         selectedEmailComponents.forEach((compKey) => {
-          const items = (compareResult as any)[compKey] as CompareResultItem[] || [];
+          const items = (filteredCompareResult as any)[compKey] as CompareResultItem[] || [];
           const filtered = items.filter(item => item.status !== 'identical' && item.ddl);
           if (filtered.length === 0) return;
 
@@ -1038,8 +1191,8 @@ Destination Database:
   };
 
   const handleDownloadComponentFiles = (type: string, status: 'missing' | 'extra' | 'different') => {
-    if (!compareResult) return;
-    const items = (compareResult as any)[type] as CompareResultItem[];
+    if (!filteredCompareResult) return;
+    const items = (filteredCompareResult as any)[type] as CompareResultItem[];
     const filtered = items.filter(i => i.status === status);
 
     if (filtered.length === 0) {
@@ -1417,7 +1570,10 @@ ${joined}${suffix}
         <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
           <div
             style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
-            onClick={() => router.push('/dashboard')}
+            onClick={() => {
+              setStep(1);
+              setActiveParentTab('compare');
+            }}
           >
             <div style={{
               width: 32,
@@ -1441,10 +1597,16 @@ ${joined}${suffix}
               {[
                 { key: 'compare' as const, label: 'Compare Wizard', icon: Sliders },
                 { key: 'profiles' as const, label: 'Connection Profiles', icon: Database },
+                { key: 'logs' as const, label: 'Execution Logs', icon: TerminalIcon },
               ].map(tab => (
                 <button
                   key={tab.key}
-                  onClick={() => setActiveParentTab(tab.key)}
+                  onClick={() => {
+                    setActiveParentTab(tab.key);
+                    if (tab.key === 'logs') {
+                      loadExecutionLogs();
+                    }
+                  }}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
@@ -1491,7 +1653,10 @@ ${joined}${suffix}
             {dark ? <Sun style={{ width: 16, height: 16, color: CB.yellow }} /> : <Moon style={{ width: 16, height: 16, color: CB.primary }} />}
           </button>
           <button
-            onClick={() => router.push('/dashboard')}
+            onClick={() => {
+              setStep(1);
+              setActiveParentTab('compare');
+            }}
             style={{
               ...pillBtnSecondary,
               height: 36,
@@ -1500,7 +1665,7 @@ ${joined}${suffix}
             }}
           >
             <ArrowLeft style={{ width: 14, height: 14 }} />
-            Dashboard
+            Compare Home
           </button>
         </div>
       </header>
@@ -1841,6 +2006,382 @@ ${joined}${suffix}
           </div>
         )}
 
+        {/* ═══ EXECUTION LOGS TAB ═══ */}
+        {activeParentTab === 'logs' && !loadingCompare && step < 3 && (
+          <div style={{ width: '100%' }}>
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: 40,
+              gap: 16
+            }}>
+              <div>
+                <h2 style={{
+                  fontSize: 36,
+                  fontWeight: 400,
+                  color: CB.ink,
+                  letterSpacing: -0.5,
+                  margin: 0,
+                }}>
+                  Execution Logs
+                </h2>
+                <p style={{ fontSize: 16, color: CB.body, marginTop: 8 }}>
+                  Track step-by-step progress and detailed failures of the schema compare executions.
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button
+                  onClick={loadExecutionLogs}
+                  disabled={loadingLogs}
+                  style={{
+                    ...pillBtnSecondary,
+                    height: 40,
+                    padding: '0 16px',
+                    fontSize: 14,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6
+                  }}
+                >
+                  <RefreshCw style={{ width: 14, height: 14 }} className={loadingLogs ? "animate-spin" : ""} />
+                  Refresh
+                </button>
+                <button
+                  onClick={handleClearExecutionLogs}
+                  disabled={allExecutionLogs.length === 0}
+                  style={{
+                    ...pillBtnSecondary,
+                    height: 40,
+                    padding: '0 16px',
+                    fontSize: 14,
+                    color: allExecutionLogs.length > 0 ? CB.down : CB.muted,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6
+                  }}
+                  onMouseEnter={(e) => {
+                    if (allExecutionLogs.length > 0) {
+                      e.currentTarget.style.background = `${CB.down}10`;
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = CB.surfaceStrong;
+                  }}
+                >
+                  <Trash2 style={{ width: 14, height: 14 }} />
+                  Clear Logs
+                </button>
+              </div>
+            </div>
+
+            {loadingLogs && allExecutionLogs.length === 0 ? (
+              <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '80px 0',
+                ...cardStyle
+              }}>
+                <Loader2 style={{ width: 32, height: 32, color: CB.primary }} className="animate-spin" />
+                <span style={{ fontSize: 14, color: CB.muted, marginTop: 12 }}>Fetching execution history...</span>
+              </div>
+            ) : allExecutionLogs.length === 0 ? (
+              <div style={{
+                textAlign: 'center',
+                padding: '80px 48px',
+                border: `1px dashed ${CB.hairline}`,
+                borderRadius: 24,
+                color: CB.muted,
+                background: dark ? CB.surfaceSoft : CB.canvas,
+              }}>
+                <TerminalIcon style={{ width: 48, height: 48, color: CB.mutedSoft, margin: '0 auto 16px' }} />
+                <h3 style={{ fontSize: 18, fontWeight: 600, color: CB.ink, margin: '0 0 8px' }}>No Execution Logs</h3>
+                <p style={{ fontSize: 14, color: CB.body, maxWidth: 440, margin: '0 auto' }}>
+                  Run a database schema comparison from the Compare Wizard to start recording execution logs.
+                </p>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {allExecutionLogs.map((exec) => {
+                  const isExpanded = expandedExecId === exec.id;
+                  const formattedTime = new Date(exec.timestamp).toLocaleString();
+                  const totalSteps = exec.steps?.length || 0;
+                  const successfulSteps = exec.steps?.filter((s: any) => s.status === 'success').length || 0;
+                  const failedSteps = exec.steps?.filter((s: any) => s.status === 'failed').length || 0;
+
+                  return (
+                    <div
+                      key={exec.id}
+                      style={{
+                        ...cardStyle,
+                        border: isExpanded ? `1px solid ${CB.primary}` : `1px solid ${CB.hairline}`,
+                        transition: 'all 0.2s ease',
+                      }}
+                    >
+                      {/* Exec Header */}
+                      <div
+                        onClick={() => setExpandedExecId(isExpanded ? null : exec.id)}
+                        style={{
+                          padding: '20px 24px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          cursor: 'pointer',
+                          background: isExpanded ? (dark ? `${CB.primary}05` : `${CB.primary}02`) : 'transparent',
+                          userSelect: 'none',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 16, minWidth: 0 }}>
+                          {exec.status === 'running' ? (
+                            <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                              <Loader2 style={{ width: 24, height: 24, color: CB.primary }} className="animate-spin" />
+                            </div>
+                          ) : exec.status === 'success' ? (
+                            <CheckCircle2 style={{ width: 24, height: 24, color: CB.up }} />
+                          ) : (
+                            <XCircle style={{ width: 24, height: 24, color: CB.down }} />
+                          )}
+
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                              <span style={{ fontSize: 15, fontWeight: 600, color: CB.ink }}>
+                                Run {exec.id.replace('exec-', '')}
+                              </span>
+                              <span style={{ fontSize: 12, color: CB.muted }}>
+                                {formattedTime}
+                              </span>
+                              <span style={{
+                                fontSize: 11,
+                                fontWeight: 600,
+                                padding: '2px 8px',
+                                borderRadius: 100,
+                                background: exec.status === 'success' ? `${CB.up}10` : exec.status === 'failed' ? `${CB.down}10` : `${CB.primary}10`,
+                                color: exec.status === 'success' ? CB.up : exec.status === 'failed' ? CB.down : CB.primary,
+                              }}>
+                                {exec.status.toUpperCase()}
+                              </span>
+                            </div>
+                            <div style={{
+                              fontSize: 13,
+                              color: CB.body,
+                              marginTop: 4,
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                            }}>
+                              <span style={{ fontWeight: 500 }}>{exec.sourceDb}</span>
+                              <span style={{ color: CB.mutedSoft }}>➔</span>
+                              <span style={{ fontWeight: 500 }}>{exec.destDb}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                          <span style={{ fontSize: 13, color: CB.muted, fontFamily: "'Inter', sans-serif" }}>
+                            {failedSteps > 0 ? (
+                              <span style={{ color: CB.down, fontWeight: 500 }}>{failedSteps} failed</span>
+                            ) : exec.status === 'running' ? (
+                              <span>Step {successfulSteps + 1} running</span>
+                            ) : (
+                              <span>{successfulSteps}/{totalSteps} steps ok</span>
+                            )}
+                          </span>
+                          {isExpanded ? (
+                            <ChevronDown style={{ width: 20, height: 20, color: CB.muted }} />
+                          ) : (
+                            <ChevronRight style={{ width: 20, height: 20, color: CB.muted }} />
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Exec Expanded Body */}
+                      {isExpanded && (
+                        <div style={{
+                          borderTop: `1px solid ${CB.hairline}`,
+                          background: dark ? CB.canvas : '#fafafa',
+                          padding: '24px',
+                        }}>
+                          {exec.error && (
+                            <div style={{
+                              background: `${CB.down}10`,
+                              border: `1px solid ${CB.down}20`,
+                              borderRadius: 16,
+                              padding: '16px',
+                              marginBottom: 20,
+                              color: CB.down,
+                              fontSize: 14,
+                              fontWeight: 500,
+                              display: 'flex',
+                              alignItems: 'flex-start',
+                              gap: 10
+                            }}>
+                              <XCircle style={{ width: 18, height: 18, flexShrink: 0, marginTop: 1 }} />
+                              <div>
+                                <div style={{ fontWeight: 600, marginBottom: 4 }}>Execution Failed</div>
+                                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, wordBreak: 'break-all' }}>
+                                  {exec.error}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          <h4 style={{ fontSize: 14, fontWeight: 600, color: CB.ink, margin: '0 0 12px' }}>
+                            Step Details
+                          </h4>
+
+                          {(!exec.steps || exec.steps.length === 0) ? (
+                            <div style={{ fontSize: 13, color: CB.muted, padding: 12, textAlign: 'center' }}>
+                              No steps registered yet for this execution.
+                            </div>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                              {exec.steps.map((stepItem: any, sIdx: number) => {
+                                const isStepExpanded = expandedStepName === `${exec.id}-${stepItem.name}`;
+                                const durationText = stepItem.durationMs !== undefined
+                                  ? `${(stepItem.durationMs / 1000).toFixed(2)}s`
+                                  : '';
+
+                                return (
+                                  <div
+                                    key={sIdx}
+                                    style={{
+                                      background: dark ? CB.surfaceStrong : CB.canvas,
+                                      border: `1px solid ${CB.hairline}`,
+                                      borderRadius: 12,
+                                      overflow: 'hidden',
+                                    }}
+                                  >
+                                    <div
+                                      onClick={() => setExpandedStepName(isStepExpanded ? null : `${exec.id}-${stepItem.name}`)}
+                                      style={{
+                                        padding: '12px 16px',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'space-between',
+                                        cursor: 'pointer',
+                                        userSelect: 'none',
+                                      }}
+                                    >
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+                                        {stepItem.status === 'success' ? (
+                                          <CheckCircle2 style={{ width: 16, height: 16, color: CB.up, flexShrink: 0 }} />
+                                        ) : stepItem.status === 'failed' ? (
+                                          <XCircle style={{ width: 16, height: 16, color: CB.down, flexShrink: 0 }} />
+                                        ) : stepItem.status === 'running' ? (
+                                          <Loader2 style={{ width: 16, height: 16, color: CB.primary, flexShrink: 0 }} className="animate-spin" />
+                                        ) : (
+                                          <div style={{ width: 16, height: 16, borderRadius: 999, border: `2px solid ${CB.mutedSoft}`, flexShrink: 0 }} />
+                                        )}
+
+                                        <span style={{
+                                          fontSize: 13,
+                                          fontWeight: 600,
+                                          color: stepItem.status === 'failed' ? CB.down : CB.ink,
+                                          overflow: 'hidden',
+                                          textOverflow: 'ellipsis',
+                                          whiteSpace: 'nowrap',
+                                        }}>
+                                          {stepItem.name}
+                                        </span>
+                                      </div>
+
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                                        {durationText && (
+                                          <span style={{ fontSize: 12, color: CB.muted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                            {durationText}
+                                          </span>
+                                        )}
+                                        {stepItem.logs?.length > 0 && (
+                                          <span style={{
+                                            fontSize: 11,
+                                            fontWeight: 600,
+                                            background: dark ? CB.surfaceSoft : CB.surfaceStrong,
+                                            color: CB.muted,
+                                            padding: '2px 6px',
+                                            borderRadius: 6
+                                          }}>
+                                            {stepItem.logs.length} logs
+                                          </span>
+                                        )}
+                                        {isStepExpanded ? (
+                                          <ChevronDown style={{ width: 16, height: 16, color: CB.muted }} />
+                                        ) : (
+                                          <ChevronRight style={{ width: 16, height: 16, color: CB.muted }} />
+                                        )}
+                                      </div>
+                                    </div>
+
+                                    {/* Step failure details callout */}
+                                    {stepItem.error && (
+                                      <div style={{
+                                        background: `${CB.down}05`,
+                                        borderTop: `1px solid ${CB.hairline}`,
+                                        padding: '10px 16px',
+                                        fontSize: 12,
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        color: CB.down,
+                                        wordBreak: 'break-all',
+                                      }}>
+                                        Error: {stepItem.error}
+                                      </div>
+                                    )}
+
+                                    {/* Step Logs */}
+                                    {isStepExpanded && (
+                                      <div style={{
+                                        borderTop: `1px solid ${CB.hairline}`,
+                                        background: CB.surfaceDark,
+                                        padding: '12px 16px',
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        fontSize: 12,
+                                        color: CB.onDarkSoft,
+                                        maxHeight: 280,
+                                        overflowY: 'auto',
+                                        lineHeight: 1.6,
+                                      }}>
+                                        {(!stepItem.logs || stepItem.logs.length === 0) ? (
+                                          <div style={{ color: CB.onDarkSoft, opacity: 0.5, fontStyle: 'italic' }}>
+                                            No detailed logs for this step.
+                                          </div>
+                                        ) : (
+                                          stepItem.logs.map((logEntry: any, lIdx: number) => {
+                                            const entryTime = new Date(logEntry.timestamp).toLocaleTimeString([], {
+                                              hour: '2-digit', minute: '2-digit', second: '2-digit'
+                                            });
+                                            let color = CB.onDarkSoft;
+                                            if (logEntry.level === 'error') color = CB.down;
+                                            else if (logEntry.level === 'warn') color = CB.yellow;
+
+                                            return (
+                                              <div key={lIdx} style={{ color, wordBreak: 'break-all', marginBottom: 4 }}>
+                                                <span style={{ opacity: 0.4, marginRight: 8 }}>[{entryTime}]</span>
+                                                <span>{logEntry.message}</span>
+                                              </div>
+                                            );
+                                          })
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ═══ COMPARE WIZARD ═══ */}
         {activeParentTab === 'compare' && !loadingCompare && (
           <>
@@ -2055,7 +2596,7 @@ ${joined}${suffix}
             )}
 
             {/* STEP 3: RESULTS */}
-            {step === 3 && compareResult && (
+            {step === 3 && filteredCompareResult && (
               <div>
                 {/* Summary hero band (dark) */}
                 <div style={{
@@ -2080,14 +2621,14 @@ ${joined}${suffix}
                       Comparison complete
                     </h2>
                     <p style={{ fontSize: 16, color: CB.onDarkSoft, marginTop: 8, lineHeight: 1.5 }}>
-                      Found <span style={{ color: CB.onDark, fontWeight: 600 }}>{compareResult.summary.totalDrifts}</span> schema drifts across selected components
+                      Found <span style={{ color: CB.onDark, fontWeight: 600 }}>{filteredCompareResult.summary.totalDrifts}</span> schema drifts across selected components
                     </p>
                   </div>
                   <div style={{ display: 'flex', gap: 16 }}>
                     {[
-                      { label: 'Missing', count: compareResult.summary.missingCount, color: CB.up },
-                      { label: 'Different', count: compareResult.summary.differentCount, color: CB.yellow },
-                      { label: 'Extra', count: compareResult.summary.extraCount, color: CB.down },
+                      { label: 'Missing', count: filteredCompareResult.summary.missingCount, color: CB.up },
+                      { label: 'Different', count: filteredCompareResult.summary.differentCount, color: CB.yellow },
+                      { label: 'Extra', count: filteredCompareResult.summary.extraCount, color: CB.down },
                     ].map(stat => (
                       <div key={stat.label} style={{
                         ...cardDarkStyle,
@@ -2116,6 +2657,91 @@ ${joined}${suffix}
                 <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: 24 }}>
                   {/* Left sidebar */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                    {/* Backup Filter Card */}
+                    <div style={{ ...cardStyle, padding: 16 }}>
+                      <div style={{
+                        fontSize: 12,
+                        fontWeight: 600,
+                        color: CB.muted,
+                        textTransform: 'uppercase' as const,
+                        letterSpacing: 0.5,
+                        padding: '0 8px',
+                        marginBottom: 12,
+                      }}>
+                        Filter Options
+                      </div>
+                      <label style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 10,
+                        padding: '8px 8px 4px',
+                        cursor: 'pointer',
+                        fontSize: 14,
+                        color: CB.ink,
+                        fontWeight: 600,
+                        userSelect: 'none',
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={skipBackupObjects}
+                          onChange={(e) => setSkipBackupObjects(e.target.checked)}
+                          style={{
+                            width: 16,
+                            height: 16,
+                            borderRadius: 4,
+                            accentColor: CB.primary,
+                            cursor: 'pointer',
+                          }}
+                        />
+                        <span>Skip Backup Objects</span>
+                      </label>
+                      <p style={{
+                        fontSize: 11,
+                        color: CB.muted,
+                        margin: '4px 8px 0',
+                        lineHeight: 1.4,
+                      }}>
+                        Hides tables, views, and functions ending with backup date formats (e.g. _ddmmyy or _ddmmyyyy).
+                      </p>
+
+                      <label style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 10,
+                        padding: '8px 8px 4px',
+                        cursor: 'pointer',
+                        fontSize: 14,
+                        color: CB.ink,
+                        fontWeight: 600,
+                        userSelect: 'none',
+                        borderTop: `1px solid ${CB.hairlineSoft}`,
+                        marginTop: 12,
+                        paddingTop: 12,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={skipDummyObjects}
+                          onChange={(e) => setSkipDummyObjects(e.target.checked)}
+                          style={{
+                            width: 16,
+                            height: 16,
+                            borderRadius: 4,
+                            accentColor: CB.primary,
+                            cursor: 'pointer',
+                          }}
+                        />
+                        <span>Skip Copy/Dummy Objects</span>
+                      </label>
+                      <p style={{
+                        fontSize: 11,
+                        color: CB.muted,
+                        margin: '4px 8px 0',
+                        lineHeight: 1.4,
+                      }}>
+                        Hides tables, views, and functions ending with copy/dummy suffixes (e.g. _1, _2, _3).
+                      </p>
+                    </div>
+
                     <div style={{ ...cardStyle, padding: 16 }}>
                       <div style={{
                         fontSize: 12,
@@ -2132,7 +2758,7 @@ ${joined}${suffix}
                         {Object.entries(COMP_META).map(([key, meta]) => {
                           if (!selectedComponents.includes(key)) return null;
                           const isActive = activeCompType === key;
-                          const items = (compareResult as any)[key] as CompareResultItem[] || [];
+                          const items = (filteredCompareResult as any)[key] as CompareResultItem[] || [];
                           const driftCount = items.filter(i => i.status !== 'identical').length;
                           const Icon = meta.icon;
 
@@ -2253,8 +2879,8 @@ ${joined}${suffix}
                         onClick={() => {
                           const order = ['types', 'sequences', 'tables', 'views', 'functions', 'triggers'];
                           const sqlStatements: string[] = [];
-                          order.forEach((compKey) => {
-                            const items = (compareResult as any)[compKey] as CompareResultItem[] || [];
+                           order.forEach((compKey) => {
+                            const items = (filteredCompareResult as any)[compKey] as CompareResultItem[] || [];
                             items.forEach((item) => {
                               if (item.status !== 'identical' && item.ddl) {
                                 sqlStatements.push(item.ddl);
@@ -2308,7 +2934,7 @@ ${joined}${suffix}
                           { key: 'different' as const, label: 'Different (Drifts)', color: CB.yellow },
                           { key: 'extra' as const, label: 'Extra in Target', color: CB.down },
                         ].map((tab) => {
-                          const count = compareResult ? ((compareResult as any)[activeCompType] as CompareResultItem[]).filter(i => i.status === tab.key).length : 0;
+                          const count = filteredCompareResult ? ((filteredCompareResult as any)[activeCompType] as CompareResultItem[]).filter(i => i.status === tab.key).length : 0;
                           const active = activeDriftTab === tab.key;
 
                           return (
@@ -2728,7 +3354,7 @@ ${joined}${suffix}
                     gap: 12,
                   }}>
                     {selectedComponents.map((compKey) => {
-                      const items = (compareResult as any)[compKey] as CompareResultItem[] || [];
+                      const items = (filteredCompareResult as any)[compKey] as CompareResultItem[] || [];
                       const driftCount = items.filter(i => i.status !== 'identical').length;
                       const isChecked = selectedEmailComponents.includes(compKey);
                       const hasDrifts = driftCount > 0;
