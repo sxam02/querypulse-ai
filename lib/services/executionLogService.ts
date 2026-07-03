@@ -24,6 +24,7 @@ export interface Execution {
   status: 'running' | 'success' | 'failed';
   steps: ExecutionStep[];
   error?: string;
+  result?: any;
 }
 
 class ExecutionLogService {
@@ -55,11 +56,27 @@ class ExecutionLogService {
     return newExec;
   }
 
-  updateExecutionStatus(id: string, status: 'success' | 'failed', error?: string) {
+  updateExecutionStatus(id: string, status: 'success' | 'failed', error?: string, result?: any) {
     const exec = this.getExecution(id);
     if (exec) {
       exec.status = status;
       if (error) exec.error = error;
+      if (status === 'success' && result) {
+        exec.result = result;
+      }
+      this.pruneResults();
+    }
+  }
+
+  private pruneResults() {
+    let successCount = 0;
+    for (const exec of this.executions) {
+      if (exec.status === 'success' && exec.result) {
+        successCount++;
+        if (successCount > 3) {
+          exec.result = undefined;
+        }
+      }
     }
   }
 

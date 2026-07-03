@@ -998,7 +998,8 @@ export default function SchemaComparePage() {
           body: JSON.stringify({
             action: 'update',
             id: executionId,
-            status: 'success'
+            status: 'success',
+            result: diffData
           })
         });
       } catch (logErr) {
@@ -2182,6 +2183,35 @@ ${joined}${suffix}
                         </div>
 
                         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                          {exec.result && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setCompareResult(exec.result);
+                                setStep(3);
+                                setActiveParentTab('compare');
+                                addToast('Comparison results loaded from history log!', 'success');
+                              }}
+                              style={{
+                                ...pillBtnPrimary,
+                                height: 32,
+                                padding: '0 12px',
+                                fontSize: 12,
+                                background: CB.primary,
+                                color: CB.onPrimary,
+                                border: 'none',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 6,
+                                cursor: 'pointer',
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.background = CB.primaryActive}
+                              onMouseLeave={(e) => e.currentTarget.style.background = CB.primary}
+                            >
+                              <GitCompareArrows style={{ width: 14, height: 14, color: CB.onPrimary }} />
+                              Load Results
+                            </button>
+                          )}
                           <span style={{ fontSize: 13, color: CB.muted, fontFamily: "'Inter', sans-serif" }}>
                             {failedSteps > 0 ? (
                               <span style={{ color: CB.down, fontWeight: 500 }}>{failedSteps} failed</span>

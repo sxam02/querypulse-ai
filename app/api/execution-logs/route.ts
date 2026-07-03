@@ -14,7 +14,7 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { action, id, sourceDb, destDb, components, status, error, stepName, level, message, details } = body;
+    const { action, id, sourceDb, destDb, components, status, error, stepName, level, message, details, result } = body;
 
     if (!action) {
       return NextResponse.json({ error: 'Action parameter is required' }, { status: 400 });
@@ -38,7 +38,7 @@ export async function POST(request: NextRequest) {
         if (status !== 'success' && status !== 'failed') {
           return NextResponse.json({ error: 'Invalid execution status' }, { status: 400 });
         }
-        executionLogService.updateExecutionStatus(id, status, error);
+        executionLogService.updateExecutionStatus(id, status, error, result);
         break;
 
       case 'step_start':
